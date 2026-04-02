@@ -150,6 +150,14 @@ final class AudioMetadataServiceID3ChapterParserTests: XCTestCase {
     XCTAssertEqual(chapters?[2].duration ?? -1, 706.212, accuracy: 0.000_1)
   }
 
+  func testID3ChapterParserReturnsNilForRemoteURL() {
+    let remoteURL = URL(string: "https://example.com/book.mp3")!
+
+    let chapters = ID3ChapterParser.parseChapters(fromMP3File: remoteURL, duration: 120)
+
+    XCTAssertNil(chapters)
+  }
+
   private func makeCHAPFrame(startMilliseconds: UInt32, title: String?, elementId: String) -> Data {
     var payload = Data(elementId.utf8)
     payload.append(0x00)

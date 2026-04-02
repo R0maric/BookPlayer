@@ -109,6 +109,10 @@ public class AudioMetadataService: BPLogger, AudioMetadataServiceProtocol {
     guard existingChapters == nil else { return existingChapters }
     guard let urlAsset = asset as? AVURLAsset else { return nil }
     guard urlAsset.url.pathExtension.lowercased() == "mp3" else { return nil }
+    guard urlAsset.url.isFileURL else {
+      Self.logger.info("MP3 CHAP fallback skipped: non-local URL asset")
+      return nil
+    }
 
     guard let chapters = ID3ChapterParser.parseChapters(
       fromMP3File: urlAsset.url,
@@ -420,6 +424,7 @@ struct ID3ChapterParser {
   }
 
   static func parseChapters(fromMP3File fileURL: URL, duration: TimeInterval) -> [ChapterMetadata]? {
+    guard fileURL.isFileURL else { return nil }
     guard let fileData = try? Data(contentsOf: fileURL, options: [.mappedIfSafe]),
           fileData.count >= 10
     else { return nil }

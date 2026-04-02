@@ -225,21 +225,59 @@ final class PlayerManager: NSObject, PlayerManagerProtocol, ObservableObject {
       await ArtworkService.storeInCache(data, for: chapter.relativePath)
     }
 
-    try await refreshChaptersIfNeeded(for: chapter, asset: asset)
+    await repairChaptersInLibraryIfNeeded(for: chapter, asset: asset)
+    try reloadRuntimeItemIfNeeded(for: chapter)
 
     return asset
   }
 
-  private func refreshChaptersIfNeeded(for chapter: PlayableChapter, asset: AVURLAsset) async throws {
+  private func repairChaptersInLibraryIfNeeded(for chapter: PlayableChapter, asset: AVURLAsset) async {
     if currentItem?.isBoundBook == false {
       await libraryService.loadChaptersIfNeeded(relativePath: chapter.relativePath, asset: asset)
-
-      if let libraryItem = libraryService.getSimpleItem(with: chapter.relativePath) {
-        currentItem = try playbackService.getPlayableItem(from: libraryItem)
-      }
     } else if currentItem?.isBoundBook == true, chapter.relativePath.hasSuffix(".m4b") {
       /// recently synced m4b files do not have their chapters loaded outright
       await libraryService.loadChaptersIfNeeded(relativePath: chapter.relativePath, asset: asset)
+    }
+  }
+
+  private func reloadRuntimeItemIfNeeded(for chapter: PlayableChapter) throws {
+    guard currentItem?.isBoundBook == false else { return }
+    guard let previousItem = currentItem else { return }
+    guard let libraryItem = libraryService.getSimpleItem(with: chapter.relativePath) else { return }
+
+    let updatedItem = try playbackService.getPlayableItem(from: libraryItem)
+    preserveRuntimePlaybackState(from: previousItem, to: updatedItem)
+    setCurrentItemAndBindChapterSubscription(updatedItem, skipInitialChapterNotification: true)
+  }
+
+  private func preserveRuntimePlaybackState(from previousItem: PlayableItem, to updatedItem: PlayableItem) {
+    let boundedTime = min(max(previousItem.currentTime, 0), updatedItem.duration)
+    updatedItem.currentTime = boundedTime
+    if let chapter = updatedItem.getChapter(at: boundedTime) ?? updatedItem.chapters.first {
+      updatedItem.currentChapter = chapter
+    }
+  }
+
+  private func setCurrentItemAndBindChapterSubscription(
+    _ item: PlayableItem,
+    skipInitialChapterNotification: Bool = false
+  ) {
+    currentItem = item
+
+    playableChapterSubscription?.cancel()
+    var shouldSkipNextChapterNotification = skipInitialChapterNotification
+    playableChapterSubscription = item.$currentChapter.sink { [weak self] chapter in
+      guard let self, let chapter else { return }
+
+      self.setNowPlayingBookTitle(chapter: chapter)
+
+      if shouldSkipNextChapterNotification {
+        shouldSkipNextChapterNotification = false
+        return
+      }
+
+      NotificationCenter.default.post(name: .chapterChange, object: nil, userInfo: nil)
+      self.widgetReloadService.scheduleWidgetReload(of: .sharedNowPlayingWidget)
     }
   }
 
@@ -254,7 +292,8 @@ final class PlayerManager: NSObject, PlayerManagerProtocol, ObservableObject {
       asset = try await loadRemoteURLAsset(for: chapter, forceRefresh: forceRefreshURL)
     } else {
       asset = AVURLAsset(url: fileURL, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
-      try await refreshChaptersIfNeeded(for: chapter, asset: asset)
+      await repairChaptersInLibraryIfNeeded(for: chapter, asset: asset)
+      try reloadRuntimeItemIfNeeded(for: chapter)
     }
 
     // Clean just in case
@@ -327,16 +366,7 @@ final class PlayerManager: NSObject, PlayerManagerProtocol, ObservableObject {
       currentItem = nil
     }
 
-    self.currentItem = item
-
-    self.playableChapterSubscription?.cancel()
-    self.playableChapterSubscription = item.$currentChapter.sink { [weak self] chapter in
-      guard let chapter = chapter else { return }
-
-      self?.setNowPlayingBookTitle(chapter: chapter)
-      NotificationCenter.default.post(name: .chapterChange, object: nil, userInfo: nil)
-      self?.widgetReloadService.scheduleWidgetReload(of: .sharedNowPlayingWidget)
-    }
+    setCurrentItemAndBindChapterSubscription(item)
 
     loadChapterMetadata(item.currentChapter, autoplay: autoplay, forceRefreshURL: forceRefreshURL)
     storeWidgetItem(item)
