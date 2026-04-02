@@ -151,7 +151,7 @@ public protocol LibraryServiceProtocol: AnyObject {
 
 // swiftlint:disable force_cast
 @Observable
-public final class LibraryService: LibraryServiceProtocol, @unchecked Sendable {
+public final class LibraryService: LibraryServiceProtocol, BPLogger, @unchecked Sendable {
   var dataManager: DataManager!
   var audioMetadataService: AudioMetadataServiceProtocol!
 
@@ -768,6 +768,17 @@ extension LibraryService {
       chapter.index = Int16(chapterMeta.index)
       book.addToChapters(chapter)
     }
+  }
+
+  private func replaceChapters(_ chapters: [ChapterMetadata], for book: Book, context: NSManagedObjectContext) {
+    if let existingChapters = book.chapters?.array as? [Chapter] {
+      for existingChapter in existingChapters {
+        context.delete(existingChapter)
+      }
+      book.chapters = nil
+    }
+
+    storeChapters(chapters, for: book, context: context)
   }
 
   /// Overload for backwards compatibility when we need to query by relativePath
@@ -1500,6 +1511,132 @@ extension LibraryService {
 
 // MARK: - Metadata update
 extension LibraryService {
+  private struct ChapterLoadDecision {
+    let shouldExtractMetadata: Bool
+    let shouldAttemptLegacyRepair: Bool
+    let isMP3: Bool
+  }
+
+  private func chapterLoadDecision(for book: Book) -> ChapterLoadDecision {
+    let existingChapters = (book.chapters?.array as? [Chapter]) ?? []
+    let hasNoChapters = existingChapters.isEmpty
+    let isMP3 = (book.relativePath as NSString).pathExtension.lowercased() == "mp3"
+
+    guard isMP3 else {
+      return ChapterLoadDecision(
+        shouldExtractMetadata: hasNoChapters,
+        shouldAttemptLegacyRepair: false,
+        isMP3: false
+      )
+    }
+
+    let shouldAttemptLegacyRepair = !isMP3ChapterRepairDone(for: book.relativePath)
+      && (
+        hasNoChapters
+          || hasInvalidStoredChapters(existingChapters, duration: book.duration)
+          || looksLikeLegacySingleChapter(existingChapters, duration: book.duration)
+      )
+
+    return ChapterLoadDecision(
+      shouldExtractMetadata: hasNoChapters || shouldAttemptLegacyRepair,
+      shouldAttemptLegacyRepair: shouldAttemptLegacyRepair,
+      isMP3: true
+    )
+  }
+
+  private func isMP3ChapterRepairDone(for relativePath: String) -> Bool {
+    let key = "\(Constants.UserDefaults.mp3ChapterRepairMigrationPrefix)_\(relativePath)"
+    return UserDefaults.standard.bool(forKey: key)
+  }
+
+  private func setMP3ChapterRepairDone(for relativePath: String) {
+    let key = "\(Constants.UserDefaults.mp3ChapterRepairMigrationPrefix)_\(relativePath)"
+    UserDefaults.standard.set(true, forKey: key)
+  }
+
+  private func hasInvalidStoredChapters(_ chapters: [Chapter], duration: TimeInterval) -> Bool {
+    guard !chapters.isEmpty else { return true }
+
+    var previousStart: TimeInterval = -1
+
+    for chapter in chapters {
+      let start = chapter.start
+      let chapterDuration = chapter.duration
+
+      guard start >= 0,
+            chapterDuration > 0,
+            start > previousStart
+      else {
+        return true
+      }
+
+      if duration > 0, start >= duration {
+        return true
+      }
+
+      previousStart = start
+    }
+
+    return false
+  }
+
+  private func looksLikeLegacySingleChapter(_ chapters: [Chapter], duration: TimeInterval) -> Bool {
+    guard chapters.count == 1,
+          duration > 0
+    else {
+      return false
+    }
+
+    let onlyChapter = chapters[0]
+    let isStartAtZero = abs(onlyChapter.start) < 0.05
+    let isWholeBookDuration = abs(onlyChapter.duration - duration) < 0.5
+    let looksLikeFallbackTitle = onlyChapter.title?.hasPrefix("Chapter") ?? false
+
+    return isStartAtZero && isWholeBookDuration && looksLikeFallbackTitle
+  }
+
+  private func hasValidExtractedChapters(_ chapters: [ChapterMetadata], duration: TimeInterval) -> Bool {
+    guard !chapters.isEmpty else { return false }
+
+    var previousStart: TimeInterval = -1
+    for chapter in chapters {
+      guard chapter.start >= 0,
+            chapter.duration > 0,
+            chapter.start > previousStart
+      else {
+        return false
+      }
+
+      if duration > 0, chapter.start >= duration {
+        return false
+      }
+
+      previousStart = chapter.start
+    }
+
+    return true
+  }
+
+  private func shouldReplaceStoredChapters(
+    _ existingChapters: [Chapter],
+    with extractedChapters: [ChapterMetadata],
+    duration: TimeInterval
+  ) -> Bool {
+    guard !existingChapters.isEmpty else { return true }
+    guard !hasInvalidStoredChapters(existingChapters, duration: duration) else { return true }
+    guard extractedChapters.count >= existingChapters.count else { return false }
+
+    if extractedChapters.count > existingChapters.count {
+      return true
+    }
+
+    return zip(existingChapters, extractedChapters).contains { existingChapter, extractedChapter in
+      abs(existingChapter.start - extractedChapter.start) > 0.05
+        || abs(existingChapter.duration - extractedChapter.duration) > 0.05
+        || (existingChapter.title ?? "") != extractedChapter.title
+    }
+  }
+
   public func createBook(from url: URL) async -> Book {
     let context = dataManager.getContext()
     
@@ -1521,30 +1658,77 @@ extension LibraryService {
   public func loadChaptersIfNeeded(relativePath: String, asset: AVAsset) async {
     let context = dataManager.getBackgroundContext()
 
-    // First, check if we need to load chapters
-    let needsChapters = await context.perform { [unowned self] in
+    let loadDecision = await context.perform { [unowned self] in
       guard let book = self.getItem(with: relativePath, context: context) as? Book else {
-        return false
+        return ChapterLoadDecision(
+          shouldExtractMetadata: false,
+          shouldAttemptLegacyRepair: false,
+          isMP3: false
+        )
       }
-      return book.chapters?.count == 0
+      return self.chapterLoadDecision(for: book)
     }
 
-    guard needsChapters else { return }
+    guard loadDecision.shouldExtractMetadata else { return }
 
-    // Extract metadata outside of context.perform
     guard let metadata = await audioMetadataService.extractMetadata(from: asset),
           let chapters = metadata.chapters else {
+      if loadDecision.shouldAttemptLegacyRepair {
+        Self.logger.info("MP3 legacy chapter repair skipped: no metadata chapters for \(relativePath)")
+      }
       return
     }
 
-    // Store chapters in the context, re-checking if still needed to avoid race conditions
     await context.perform { [unowned self] in
-      guard let book = self.getItem(with: relativePath, context: context) as? Book,
-            book.chapters?.count == 0 else {
+      guard let book = self.getItem(with: relativePath, context: context) as? Book else {
         return
       }
-      self.storeChapters(chapters, for: book, context: context)
+
+      let currentChapters = (book.chapters?.array as? [Chapter]) ?? []
+
+      if loadDecision.shouldAttemptLegacyRepair {
+        guard self.hasValidExtractedChapters(chapters, duration: book.duration) else {
+          Self.logger.info("MP3 legacy chapter repair skipped: invalid extracted chapters for \(relativePath)")
+          return
+        }
+
+        guard self.shouldReplaceStoredChapters(currentChapters, with: chapters, duration: book.duration) else {
+          return
+        }
+
+        self.replaceChapters(chapters, for: book, context: context)
+        self.setMP3ChapterRepairDone(for: relativePath)
+        Self.logger.info("MP3 legacy chapter repair applied for \(relativePath)")
+      } else {
+        guard currentChapters.isEmpty else { return }
+        self.storeChapters(chapters, for: book, context: context)
+      }
+
       self.dataManager.saveSyncContext(context)
+    }
+
+    if loadDecision.shouldAttemptLegacyRepair {
+      let verificationDecision = await context.perform { [unowned self] in
+        guard let book = self.getItem(with: relativePath, context: context) as? Book else {
+          return false
+        }
+        return !self.chapterLoadDecision(for: book).shouldAttemptLegacyRepair
+      }
+
+      if verificationDecision {
+        setMP3ChapterRepairDone(for: relativePath)
+      }
+    } else if loadDecision.isMP3 {
+      let hasStoredChapters = await context.perform { [unowned self] in
+        guard let book = self.getItem(with: relativePath, context: context) as? Book else {
+          return false
+        }
+        return ((book.chapters?.array as? [Chapter]) ?? []).isEmpty == false
+      }
+
+      if hasStoredChapters {
+        setMP3ChapterRepairDone(for: relativePath)
+      }
     }
   }
 

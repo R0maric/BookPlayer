@@ -6,6 +6,7 @@
 //  Copyright © 2021 BookPlayer LLC. All rights reserved.
 //
 
+import AVFoundation
 import Foundation
 
 @testable import BookPlayer
@@ -1899,5 +1900,133 @@ class SearchTests: LibraryServiceTests {
 
     XCTAssert(results?.count == 1)
     XCTAssert(results?.first?.details == "Stephen King")
+  }
+}
+
+private final class MockAudioMetadataService: AudioMetadataServiceProtocol {
+  var metadataForAsset: AudioMetadata?
+  private(set) var extractMetadataFromAssetCallCount = 0
+
+  func extractMetadata(from fileURL: URL) async -> AudioMetadata? {
+    metadataForAsset
+  }
+
+  func extractMetadata(from asset: AVAsset) async -> AudioMetadata? {
+    extractMetadataFromAssetCallCount += 1
+    return metadataForAsset
+  }
+}
+
+class LegacyMP3ChapterRepairTests: LibraryServiceTests {
+  private var mockAudioMetadataService: MockAudioMetadataService!
+
+  override func setUp() {
+    super.setUp()
+    mockAudioMetadataService = MockAudioMetadataService()
+    sut.audioMetadataService = mockAudioMetadataService
+  }
+
+  override func tearDown() {
+    super.tearDown()
+    let defaults = UserDefaults.standard
+    let prefix = Constants.UserDefaults.mp3ChapterRepairMigrationPrefix
+    for key in defaults.dictionaryRepresentation().keys where key.hasPrefix(prefix) {
+      defaults.removeObject(forKey: key)
+    }
+  }
+
+  func testLoadChaptersIfNeededRepairsLegacyMP3Chapters() async {
+    let book = StubFactory.book(dataManager: sut.dataManager, title: "legacy-mp3", duration: 1718.695)
+    book.relativePath = "\(UUID().uuidString).mp3"
+
+    let invalidChapter = Chapter(context: sut.dataManager.getContext())
+    invalidChapter.title = "Chapter 1"
+    invalidChapter.start = 0
+    invalidChapter.duration = 0
+    invalidChapter.index = 0
+    book.chapters = NSOrderedSet(array: [invalidChapter])
+    sut.dataManager.saveContext()
+
+    mockAudioMetadataService.metadataForAsset = AudioMetadata(
+      title: "legacy-mp3",
+      duration: 1718.695,
+      chapters: [
+        ChapterMetadata(title: "Chapter 1", start: 0, duration: 17.879, index: 0),
+        ChapterMetadata(title: "Chapter 2", start: 17.879, duration: 994.604, index: 1),
+        ChapterMetadata(title: "Chapter 3", start: 1012.483, duration: 706.212, index: 2)
+      ]
+    )
+
+    await sut.loadChaptersIfNeeded(relativePath: book.relativePath, asset: AVAsset(url: URL(fileURLWithPath: "/dev/null")))
+
+    let chapters = sut.getChapters(from: book.relativePath)
+    XCTAssertEqual(chapters?.count, 3)
+    XCTAssertEqual(chapters?.first?.title, "Chapter 1")
+    XCTAssertEqual(chapters?[1].title, "Chapter 2")
+    XCTAssertEqual(chapters?.last?.title, "Chapter 3")
+    XCTAssertEqual(chapters?.first?.start ?? -1, 0, accuracy: 0.000_1)
+    XCTAssertEqual(chapters?[1].start ?? -1, 17.879, accuracy: 0.000_1)
+    XCTAssertEqual(chapters?.last?.start ?? -1, 1012.483, accuracy: 0.000_1)
+  }
+
+  func testLoadChaptersIfNeededDoesNotReparseValidMP3Chapters() async {
+    let book = StubFactory.book(dataManager: sut.dataManager, title: "valid-mp3", duration: 120)
+    book.relativePath = "\(UUID().uuidString).mp3"
+
+    let chapter1 = Chapter(context: sut.dataManager.getContext())
+    chapter1.title = "Chapter 1"
+    chapter1.start = 0
+    chapter1.duration = 60
+    chapter1.index = 0
+
+    let chapter2 = Chapter(context: sut.dataManager.getContext())
+    chapter2.title = "Chapter 2"
+    chapter2.start = 60
+    chapter2.duration = 60
+    chapter2.index = 1
+
+    book.chapters = NSOrderedSet(array: [chapter1, chapter2])
+    sut.dataManager.saveContext()
+
+    mockAudioMetadataService.metadataForAsset = AudioMetadata(
+      title: "valid-mp3",
+      duration: 120,
+      chapters: [
+        ChapterMetadata(title: "Chapter 1", start: 0, duration: 60, index: 0),
+        ChapterMetadata(title: "Chapter 2", start: 60, duration: 60, index: 1)
+      ]
+    )
+
+    await sut.loadChaptersIfNeeded(relativePath: book.relativePath, asset: AVAsset(url: URL(fileURLWithPath: "/dev/null")))
+
+    XCTAssertEqual(mockAudioMetadataService.extractMetadataFromAssetCallCount, 0)
+  }
+
+  func testLoadChaptersIfNeededKeepsExistingChaptersWhenRepairMetadataIsInvalid() async {
+    let book = StubFactory.book(dataManager: sut.dataManager, title: "invalid-repair-mp3", duration: 100)
+    book.relativePath = "\(UUID().uuidString).mp3"
+
+    let existingChapter = Chapter(context: sut.dataManager.getContext())
+    existingChapter.title = "Legacy Chapter"
+    existingChapter.start = 0
+    existingChapter.duration = 100
+    existingChapter.index = 0
+    book.chapters = NSOrderedSet(array: [existingChapter])
+    sut.dataManager.saveContext()
+
+    mockAudioMetadataService.metadataForAsset = AudioMetadata(
+      title: "invalid-repair-mp3",
+      duration: 100,
+      chapters: [
+        ChapterMetadata(title: "Invalid", start: 0, duration: 0, index: 0)
+      ]
+    )
+
+    await sut.loadChaptersIfNeeded(relativePath: book.relativePath, asset: AVAsset(url: URL(fileURLWithPath: "/dev/null")))
+
+    let chapters = sut.getChapters(from: book.relativePath)
+    XCTAssertEqual(chapters?.count, 1)
+    XCTAssertEqual(chapters?.first?.title, "Legacy Chapter")
+    XCTAssertEqual(chapters?.first?.duration ?? -1, 100, accuracy: 0.000_1)
   }
 }
