@@ -68,7 +68,27 @@ public class AudioMetadataService: BPLogger, AudioMetadataServiceProtocol {
   
   public func extractMetadata(from fileURL: URL) async -> AudioMetadata? {
     let asset = AVURLAsset(url: fileURL)
-    return await extractMetadata(from: asset)
+    guard let metadata = await extractMetadata(from: asset) else { return nil }
+
+    guard metadata.chapters == nil,
+          fileURL.pathExtension.lowercased() == "mp3"
+    else {
+      return metadata
+    }
+
+    if let chapters = ID3ChapterParser.parseChapters(fromMP3File: fileURL, duration: metadata.duration),
+       !chapters.isEmpty {
+      return AudioMetadata(
+        title: metadata.title,
+        artist: metadata.artist,
+        duration: metadata.duration,
+        artwork: metadata.artwork,
+        chapters: chapters
+      )
+    }
+
+    Self.logger.info("No usable ID3 CHAP chapters found in MP3 file fallback parser")
+    return metadata
   }
   
   public func extractMetadata(from asset: AVAsset) async -> AudioMetadata? {
@@ -391,6 +411,39 @@ struct ID3ChapterParser {
     return buildChapterMetadata(from: chapterData.map { ($0.start, $0.title) }, duration: duration)
   }
 
+  static func parseChapters(fromMP3File fileURL: URL, duration: TimeInterval) -> [ChapterMetadata]? {
+    guard let fileData = try? Data(contentsOf: fileURL, options: [.mappedIfSafe]),
+          fileData.count >= 10
+    else { return nil }
+
+    guard fileData.starts(with: Data("ID3".utf8)) else { return nil }
+    let majorVersion = Int(fileData[3])
+    guard majorVersion == 3 || majorVersion == 4 else { return nil }
+
+    let flags = fileData[5]
+    let tagSize = Int(UInt32(syncSafeData: fileData.subdata(in: 6..<10)))
+    let tagEnd = min(fileData.count, 10 + tagSize)
+    guard tagEnd > 10 else { return nil }
+
+    let tagData = fileData.subdata(in: 10..<tagEnd)
+    guard let framePayloads = extractCHAPFrames(fromID3TagData: tagData, majorVersion: majorVersion, flags: flags),
+          !framePayloads.isEmpty
+    else {
+      return nil
+    }
+
+    return parseChapters(from: framePayloads, duration: duration)
+  }
+
+  static func parseChapters(fromID3TagData tagData: Data, majorVersion: Int, flags: UInt8, duration: TimeInterval) -> [ChapterMetadata]? {
+    guard let framePayloads = extractCHAPFrames(fromID3TagData: tagData, majorVersion: majorVersion, flags: flags),
+          !framePayloads.isEmpty
+    else {
+      return nil
+    }
+    return parseChapters(from: framePayloads, duration: duration)
+  }
+
   static func buildChapterMetadata(
     from chapters: [(start: TimeInterval, title: String?)],
     duration: TimeInterval
@@ -472,6 +525,62 @@ struct ID3ChapterParser {
     }
 
     return data.subdata(in: 10..<data.count)
+  }
+
+  private static func extractCHAPFrames(fromID3TagData tagData: Data, majorVersion: Int, flags: UInt8) -> [Data]? {
+    var framesOffset = 0
+
+    // ID3 extended header
+    if (flags & 0x40) != 0 {
+      guard tagData.count >= 4 else { return nil }
+      let extHeaderSize: Int
+      if majorVersion == 4 {
+        extHeaderSize = Int(UInt32(syncSafeData: tagData.subdata(in: 0..<4)))
+      } else {
+        extHeaderSize = Int(UInt32(bigEndianData: tagData.subdata(in: 0..<4)))
+      }
+      guard extHeaderSize > 0, extHeaderSize <= tagData.count else { return nil }
+      framesOffset = extHeaderSize
+    }
+
+    var chapterFrames: [Data] = []
+    var offset = framesOffset
+
+    while offset + 10 <= tagData.count {
+      let frameHeader = tagData.subdata(in: offset..<(offset + 10))
+      let frameIdData = frameHeader.subdata(in: 0..<4)
+
+      if frameIdData.allSatisfy({ $0 == 0 }) {
+        break
+      }
+
+      guard let frameId = String(data: frameIdData, encoding: .ascii),
+            frameId.allSatisfy({ $0.isASCII && !$0.isWhitespace }) else {
+        break
+      }
+
+      let sizeBytes = frameHeader.subdata(in: 4..<8)
+      let standardSize = Int(UInt32(bigEndianData: sizeBytes))
+      let syncSafeSize = Int(UInt32(syncSafeData: sizeBytes))
+      let frameSize: Int
+      if majorVersion == 4 {
+        frameSize = syncSafeSize
+      } else {
+        frameSize = standardSize
+      }
+
+      guard frameSize > 0 else { break }
+      let nextOffset = offset + 10 + frameSize
+      guard nextOffset <= tagData.count else { break }
+
+      if frameId == "CHAP" {
+        chapterFrames.append(tagData.subdata(in: offset..<nextOffset))
+      }
+
+      offset = nextOffset
+    }
+
+    return chapterFrames.isEmpty ? nil : chapterFrames
   }
 
   private static func parseChapterTitle(from subFramesData: Data) -> String? {

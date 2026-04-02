@@ -127,6 +127,29 @@ final class AudioMetadataServiceID3ChapterParserTests: XCTestCase {
     XCTAssertNil(chapters)
   }
 
+  func testID3ChapterParserParsesChaptersFromID3TagDataV23() {
+    let duration: TimeInterval = 1718.695
+    let chapFrames: [Data] = [
+      makeCHAPFrame(startMilliseconds: 0, title: "Chapter 1", elementId: "ch1"),
+      makeCHAPFrame(startMilliseconds: 17_879, title: "Chapter 2", elementId: "ch2"),
+      makeCHAPFrame(startMilliseconds: 1_012_483, title: "Chapter 3", elementId: "ch3")
+    ]
+    let tagData = makeID3TagData(frames: chapFrames)
+
+    let chapters = ID3ChapterParser.parseChapters(
+      fromID3TagData: tagData,
+      majorVersion: 3,
+      flags: 0,
+      duration: duration
+    )
+
+    XCTAssertEqual(chapters?.count, 3)
+    XCTAssertEqual(chapters?[0].start ?? -1, 0, accuracy: 0.000_1)
+    XCTAssertEqual(chapters?[1].start ?? -1, 17.879, accuracy: 0.000_1)
+    XCTAssertEqual(chapters?[2].start ?? -1, 1012.483, accuracy: 0.000_1)
+    XCTAssertEqual(chapters?[2].duration ?? -1, 706.212, accuracy: 0.000_1)
+  }
+
   private func makeCHAPFrame(startMilliseconds: UInt32, title: String?, elementId: String) -> Data {
     var payload = Data(elementId.utf8)
     payload.append(0x00)
@@ -159,6 +182,15 @@ final class AudioMetadataServiceID3ChapterParserTests: XCTestCase {
     frame.append(payload)
 
     return frame
+  }
+
+  private func makeID3TagData(frames: [Data]) -> Data {
+    var body = Data()
+    for frame in frames {
+      body.append(frame)
+    }
+    body.append(Data(repeating: 0x00, count: 16))
+    return body
   }
 }
 
