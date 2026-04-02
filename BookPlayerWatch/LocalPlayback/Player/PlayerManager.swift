@@ -412,7 +412,6 @@ final class PlayerManager: NSObject, PlayerManagerProtocol, ObservableObject {
         self.setNowPlayingArtwork(chapter: chapter)
 
         MPNowPlayingInfoCenter.default().nowPlayingInfo = self.nowPlayingInfo
-        MPNowPlayingInfoCenter.default().playbackState = .playing
 
         if let currentItem = self.currentItem {
           // if book is truly finished, start book again to avoid autoplaying next one
@@ -629,8 +628,9 @@ final class PlayerManager: NSObject, PlayerManagerProtocol, ObservableObject {
       at: self.currentSpeed
     )
 
-    // 1x is needed because of how the control center behaves when decrementing time
-    self.nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = 1.0
+    // Keep previously set pause/play state if present, otherwise default to 1x.
+    let playbackRate = (self.nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] as? NSNumber)?.doubleValue ?? 1.0
+    self.nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = playbackRate
     self.nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] = currentTimeInContext
 
     let playbackDuration: TimeInterval
@@ -990,7 +990,6 @@ extension PlayerManager {
     playTask?.cancel()
     loadChapterTask?.cancel()
     nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = 0.0
-    MPNowPlayingInfoCenter.default().playbackState = .paused
     setNowPlayingBookTime()
     MPNowPlayingInfoCenter.default().nowPlayingInfo = nowPlayingInfo
     if removeInterruptObserver {
@@ -1019,7 +1018,7 @@ extension PlayerManager {
     playerItem = nil
     /// Clear out flag when `playerItem` is nulled out
     hasObserverRegistered = false
-    MPNowPlayingInfoCenter.default().playbackState = .stopped
+    MPNowPlayingInfoCenter.default().nowPlayingInfo = nil
   }
 
   private func stopPlayback() {

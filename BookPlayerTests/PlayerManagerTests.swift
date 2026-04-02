@@ -145,6 +145,18 @@ class PlayerManagerTests: XCTestCase {
     XCTAssertTrue((self.sut.nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackProgress] as? Double) == 0.20)
   }
 
+  func testUpdatingNowPlayingBookTimeKeepsExistingPlaybackRate() {
+    let playableItem = generatePlayableItem()
+    playableItem.currentTime = 10
+
+    self.sut.currentItem = playableItem
+    self.sut.nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] = 0.0
+    self.sut.setNowPlayingBookTime()
+
+    XCTAssertTrue((self.sut.nowPlayingInfo[MPNowPlayingInfoPropertyPlaybackRate] as? Double) == 0.0)
+    XCTAssertTrue((self.sut.nowPlayingInfo[MPNowPlayingInfoPropertyElapsedPlaybackTime] as? Double) == 10)
+  }
+
   func testUpdatingEmptyNowPlayingBookTitle() {
     let playableItem = generatePlayableItem()
     let chapter = playableItem.chapters.first!
