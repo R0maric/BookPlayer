@@ -16,6 +16,8 @@ import XCTest
 
 class PlayerManagerTests: XCTestCase {
   var playbackServiceMock: PlaybackServiceProtocolMock!
+  var libraryServiceMock: LibraryServiceProtocolMock!
+  var syncServiceMock: SyncServiceProtocolMock!
   var sut: PlayerManager!
 
   override func setUp() {
@@ -24,10 +26,13 @@ class PlayerManagerTests: XCTestCase {
     UserDefaults.sharedDefaults.removeObject(forKey: Constants.UserDefaults.remainingTimeEnabled)
 
     self.playbackServiceMock = PlaybackServiceProtocolMock()
+    self.libraryServiceMock = LibraryServiceProtocolMock()
+    self.syncServiceMock = SyncServiceProtocolMock()
+    self.syncServiceMock.isActive = false
     self.sut = PlayerManager(
-      libraryService: LibraryServiceProtocolMock(),
+      libraryService: libraryServiceMock,
       playbackService: playbackServiceMock,
-      syncService: SyncServiceProtocolMock(),
+      syncService: syncServiceMock,
       speedService: SpeedServiceProtocolMock(),
       shakeMotionService: ShakeMotionServiceProtocolMock(),
       widgetReloadService: WidgetReloadService()
@@ -208,5 +213,191 @@ class PlayerManagerTests: XCTestCase {
 
     XCTAssertNil(nextItem)
     XCTAssertTrue(playbackServiceMock.getPlayableItemAfterParentFolderAutoplayedRestartFinishedCallsCount == 2)
+  }
+
+  func testLoadPlayerItemLocalTriggersChapterRefresh() async throws {
+    let relativePath = "local-\(UUID().uuidString).mp3"
+    try createPlayableFile(relativePath: relativePath)
+
+    let chapter = makeChapter(relativePath: relativePath, remoteURL: nil)
+    sut.currentItem = makePlayableItem(for: chapter)
+
+    try await sut.loadPlayerItem(for: chapter, forceRefreshURL: false)
+
+    XCTAssertEqual(libraryServiceMock.loadChaptersIfNeededRelativePathAssetCallsCount, 1)
+    XCTAssertEqual(libraryServiceMock.loadChaptersIfNeededRelativePathAssetReceivedArguments?.relativePath, relativePath)
+  }
+
+  func testLoadRemoteURLAssetTriggersChapterRefresh() async throws {
+    let relativePath = "remote-\(UUID().uuidString).mp3"
+    let remoteURL = try createPlayableFile(relativePath: relativePath)
+
+    let chapter = makeChapter(relativePath: relativePath, remoteURL: remoteURL)
+    sut.currentItem = makePlayableItem(for: chapter)
+
+    _ = try await sut.loadRemoteURLAsset(for: chapter, forceRefresh: false)
+
+    XCTAssertEqual(libraryServiceMock.loadChaptersIfNeededRelativePathAssetCallsCount, 1)
+    XCTAssertEqual(libraryServiceMock.loadChaptersIfNeededRelativePathAssetReceivedArguments?.relativePath, relativePath)
+  }
+
+  func testLoadPlayerItemLocalReloadRuntimeItemDoesNotPostInitialChapterChange() async throws {
+    let relativePath = "rebind-initial-\(UUID().uuidString).mp3"
+    try createPlayableFile(relativePath: relativePath)
+
+    let currentChapter = makeChapter(relativePath: relativePath, remoteURL: nil, start: 0, duration: 10, index: 0)
+    let oldItem = makePlayableItem(for: currentChapter)
+    oldItem.currentTime = 12
+    sut.currentItem = oldItem
+
+    let rebuiltChapter1 = makeChapter(relativePath: relativePath, remoteURL: nil, start: 0, duration: 10, index: 0)
+    let rebuiltChapter2 = makeChapter(relativePath: relativePath, remoteURL: nil, start: 10, duration: 10, index: 1)
+    let rebuiltItem = PlayableItem(
+      title: "book",
+      author: "author",
+      chapters: [rebuiltChapter1, rebuiltChapter2],
+      currentTime: 0,
+      duration: 20,
+      relativePath: relativePath,
+      parentFolder: nil,
+      percentCompleted: 0,
+      lastPlayDate: nil,
+      isFinished: false,
+      isBoundBook: false
+    )
+
+    libraryServiceMock.getSimpleItemWithReturnValue = makeSimpleBook(relativePath: relativePath, duration: 20)
+    playbackServiceMock.getPlayableItemFromReturnValue = rebuiltItem
+
+    var chapterChangeCount = 0
+    let observer = NotificationCenter.default.addObserver(
+      forName: .chapterChange,
+      object: nil,
+      queue: .main
+    ) { _ in
+      chapterChangeCount += 1
+    }
+    defer { NotificationCenter.default.removeObserver(observer) }
+
+    try await sut.loadPlayerItem(for: currentChapter, forceRefreshURL: false)
+
+    XCTAssertEqual(chapterChangeCount, 0)
+    XCTAssertEqual(sut.currentItem?.currentTime ?? -1, 12, accuracy: 0.000_1)
+    XCTAssertEqual(sut.currentItem?.currentChapter.start ?? -1, 10, accuracy: 0.000_1)
+  }
+
+  func testLoadPlayerItemLocalReloadRuntimeItemRebindsChapterChangeSubscription() async throws {
+    let relativePath = "rebind-change-\(UUID().uuidString).mp3"
+    try createPlayableFile(relativePath: relativePath)
+
+    let currentChapter = makeChapter(relativePath: relativePath, remoteURL: nil, start: 0, duration: 10, index: 0)
+    let oldItem = makePlayableItem(for: currentChapter)
+    oldItem.currentTime = 12
+    sut.currentItem = oldItem
+
+    let rebuiltChapter1 = makeChapter(relativePath: relativePath, remoteURL: nil, start: 0, duration: 10, index: 0)
+    let rebuiltChapter2 = makeChapter(relativePath: relativePath, remoteURL: nil, start: 10, duration: 10, index: 1)
+    let rebuiltItem = PlayableItem(
+      title: "book",
+      author: "author",
+      chapters: [rebuiltChapter1, rebuiltChapter2],
+      currentTime: 0,
+      duration: 20,
+      relativePath: relativePath,
+      parentFolder: nil,
+      percentCompleted: 0,
+      lastPlayDate: nil,
+      isFinished: false,
+      isBoundBook: false
+    )
+
+    libraryServiceMock.getSimpleItemWithReturnValue = makeSimpleBook(relativePath: relativePath, duration: 20)
+    playbackServiceMock.getPlayableItemFromReturnValue = rebuiltItem
+
+    var chapterChangeCount = 0
+    let observer = NotificationCenter.default.addObserver(
+      forName: .chapterChange,
+      object: nil,
+      queue: .main
+    ) { _ in
+      chapterChangeCount += 1
+    }
+    defer { NotificationCenter.default.removeObserver(observer) }
+
+    try await sut.loadPlayerItem(for: currentChapter, forceRefreshURL: false)
+    sut.currentItem?.currentChapter = rebuiltChapter1
+
+    XCTAssertEqual(chapterChangeCount, 1)
+  }
+
+  private func makeChapter(
+    relativePath: String,
+    remoteURL: URL?,
+    start: TimeInterval = 0,
+    duration: TimeInterval = 10,
+    index: Int16 = 0
+  ) -> PlayableChapter {
+    PlayableChapter(
+      title: "chapter",
+      author: "author",
+      start: start,
+      duration: duration,
+      relativePath: relativePath,
+      remoteURL: remoteURL,
+      index: index
+    )
+  }
+
+  private func makeSimpleBook(relativePath: String, duration: TimeInterval) -> SimpleLibraryItem {
+    SimpleLibraryItem(
+      title: "book",
+      details: "author",
+      speed: 1.0,
+      currentTime: 0,
+      duration: duration,
+      percentCompleted: 0,
+      isFinished: false,
+      relativePath: relativePath,
+      remoteURL: nil,
+      artworkURL: nil,
+      orderRank: 0,
+      parentFolder: nil,
+      originalFileName: relativePath,
+      lastPlayDate: nil,
+      type: .book
+    )
+  }
+
+  private func makePlayableItem(for chapter: PlayableChapter) -> PlayableItem {
+    PlayableItem(
+      title: "book",
+      author: "author",
+      chapters: [chapter],
+      currentTime: 0,
+      duration: chapter.duration,
+      relativePath: chapter.relativePath,
+      parentFolder: nil,
+      percentCompleted: 0,
+      lastPlayDate: nil,
+      isFinished: false,
+      isBoundBook: false
+    )
+  }
+
+  @discardableResult
+  private func createPlayableFile(relativePath: String) throws -> URL {
+    let fileURL = DataManager.getProcessedFolderURL().appendingPathComponent(relativePath)
+    let folderURL = fileURL.deletingLastPathComponent()
+
+    try FileManager.default.createDirectory(
+      at: folderURL,
+      withIntermediateDirectories: true,
+      attributes: nil
+    )
+    if !FileManager.default.fileExists(atPath: fileURL.path) {
+      FileManager.default.createFile(atPath: fileURL.path, contents: Data("test".utf8))
+    }
+
+    return fileURL
   }
 }

@@ -80,7 +80,12 @@ public class AudioMetadataService: BPLogger, AudioMetadataServiceProtocol {
       let title = await extractTitle(from: metadata)
       let artist = await extractArtist(from: metadata)
       let artwork = await extractArtwork(from: metadata)
-      let chapters = await extractChapters(from: asset, metadata: metadata, duration: durationSeconds)
+      var chapters = await extractChapters(from: asset, metadata: metadata, duration: durationSeconds)
+      chapters = resolveMP3FallbackChaptersIfNeeded(
+        from: asset,
+        duration: durationSeconds,
+        existingChapters: chapters
+      )
 
       return AudioMetadata(
         title: title,
@@ -94,6 +99,33 @@ public class AudioMetadataService: BPLogger, AudioMetadataServiceProtocol {
       Self.logger.error("Failed to extract metadata from audio asset: \(error)")
       return nil
     }
+  }
+
+  private func resolveMP3FallbackChaptersIfNeeded(
+    from asset: AVAsset,
+    duration: TimeInterval,
+    existingChapters: [ChapterMetadata]?
+  ) -> [ChapterMetadata]? {
+    guard existingChapters == nil else { return existingChapters }
+    guard let urlAsset = asset as? AVURLAsset else { return nil }
+    guard urlAsset.url.pathExtension.lowercased() == "mp3" else { return nil }
+    guard urlAsset.url.isFileURL else {
+      Self.logger.info("MP3 CHAP fallback skipped: non-local URL asset")
+      return nil
+    }
+
+    guard let chapters = ID3ChapterParser.parseChapters(
+      fromMP3File: urlAsset.url,
+      duration: duration
+    ),
+    !chapters.isEmpty
+    else {
+      Self.logger.info("MP3 CHAP fallback skipped: no usable ID3 chapter data")
+      return nil
+    }
+
+    Self.logger.info("MP3 CHAP fallback applied from ID3 tag data")
+    return chapters
   }
   
   private func extractTitle(from metadata: [AVMetadataItem]) async -> String {
@@ -283,49 +315,42 @@ public class AudioMetadataService: BPLogger, AudioMetadataServiceProtocol {
   }
 
   private func extractID3Chapters(from metadata: [AVMetadataItem], duration: TimeInterval) async -> [ChapterMetadata]? {
-    var chapterData: [(start: Double, title: String)] = []
+    var chapterFramePayloads: [Data] = []
 
     for item in metadata {
       guard let identifier = item.identifier?.rawValue,
             identifier.hasPrefix("id3/CHAP") else { continue }
 
-      // Extract chapter start time and title from CHAP frame.
-      // CHAP timestamps are relative offsets from the start of the audio (not absolute dates).
-      // Note: AVFoundation may not fully expose CHAP frame timing data currently,
-      // but we attempt to load what's available for future compatibility.
+      if let frameData = try? await item.load(.dataValue) {
+        chapterFramePayloads.append(frameData)
+      }
+    }
+
+    if let parsedChapters = ID3ChapterParser.parseChapters(from: chapterFramePayloads, duration: duration),
+       !parsedChapters.isEmpty {
+      return parsedChapters
+    }
+
+    if !chapterFramePayloads.isEmpty {
+      Self.logger.info("ID3 CHAP frames detected but parser did not return usable chapters")
+    }
+
+    // Compatibility fallback: if AVFoundation exposes numeric chapter positions directly.
+    var fallbackChapterData: [(start: TimeInterval, title: String?)] = []
+    for item in metadata {
+      guard let identifier = item.identifier?.rawValue,
+            identifier.hasPrefix("id3/CHAP") else { continue }
+
       if let numberValue = try? await item.load(.numberValue),
          numberValue.doubleValue >= 0 {
-        let startTime = numberValue.doubleValue
-        let title = (try? await item.load(.stringValue)) ?? ""
-        chapterData.append((start: startTime, title: title))
+        fallbackChapterData.append((
+          start: numberValue.doubleValue,
+          title: try? await item.load(.stringValue)
+        ))
       }
     }
 
-    // Sort chapters by start time
-    chapterData.sort { $0.start < $1.start }
-
-    var chapters: [ChapterMetadata] = []
-    for (index, data) in chapterData.enumerated() {
-      let chapterDuration: TimeInterval
-
-      // Calculate duration
-      if index < chapterData.count - 1 {
-        chapterDuration = chapterData[index + 1].start - data.start
-      } else {
-        chapterDuration = duration - data.start
-      }
-
-      let chapter = ChapterMetadata(
-        title: data.title,
-        start: data.start,
-        duration: chapterDuration,
-        index: index + 1
-      )
-
-      chapters.append(chapter)
-    }
-
-    return chapters.isEmpty ? nil : chapters
+    return ID3ChapterParser.buildChapterMetadata(from: fallbackChapterData, duration: duration)
   }
 
   private func extractOverdriveChapters(from metadata: [AVMetadataItem], duration: TimeInterval) async -> [ChapterMetadata]? {
@@ -384,5 +409,270 @@ public class AudioMetadataService: BPLogger, AudioMetadataServiceProtocol {
     }
 
     return finalChapters.isEmpty ? nil : finalChapters
+  }
+}
+
+struct ID3ChapterParser {
+  struct ParsedChapter {
+    let start: TimeInterval
+    let title: String?
+  }
+
+  static func parseChapters(from framePayloads: [Data], duration: TimeInterval) -> [ChapterMetadata]? {
+    let chapterData = framePayloads.compactMap(parseChapterFrame)
+    return buildChapterMetadata(from: chapterData.map { ($0.start, $0.title) }, duration: duration)
+  }
+
+  static func parseChapters(fromMP3File fileURL: URL, duration: TimeInterval) -> [ChapterMetadata]? {
+    guard fileURL.isFileURL else { return nil }
+    guard let fileData = try? Data(contentsOf: fileURL, options: [.mappedIfSafe]),
+          fileData.count >= 10
+    else { return nil }
+
+    guard fileData.starts(with: Data("ID3".utf8)) else { return nil }
+    let majorVersion = Int(fileData[3])
+    guard majorVersion == 3 || majorVersion == 4 else { return nil }
+
+    let flags = fileData[5]
+    let tagSize = Int(UInt32(syncSafeData: fileData.subdata(in: 6..<10)))
+    let tagEnd = min(fileData.count, 10 + tagSize)
+    guard tagEnd > 10 else { return nil }
+
+    let tagData = fileData.subdata(in: 10..<tagEnd)
+    guard let framePayloads = extractCHAPFrames(fromID3TagData: tagData, majorVersion: majorVersion, flags: flags),
+          !framePayloads.isEmpty
+    else {
+      return nil
+    }
+
+    return parseChapters(from: framePayloads, duration: duration)
+  }
+
+  static func parseChapters(fromID3TagData tagData: Data, majorVersion: Int, flags: UInt8, duration: TimeInterval) -> [ChapterMetadata]? {
+    guard let framePayloads = extractCHAPFrames(fromID3TagData: tagData, majorVersion: majorVersion, flags: flags),
+          !framePayloads.isEmpty
+    else {
+      return nil
+    }
+    return parseChapters(from: framePayloads, duration: duration)
+  }
+
+  static func buildChapterMetadata(
+    from chapters: [(start: TimeInterval, title: String?)],
+    duration: TimeInterval
+  ) -> [ChapterMetadata]? {
+    guard duration.isFinite, duration > 0 else { return nil }
+
+    let sortedChapters = chapters
+      .filter { $0.start.isFinite && $0.start >= 0 && $0.start < duration }
+      .sorted { $0.start < $1.start }
+
+    var normalizedChapters: [(start: TimeInterval, title: String?)] = []
+    var previousStart: TimeInterval = -1
+
+    for chapter in sortedChapters {
+      guard chapter.start > previousStart else { continue }
+      normalizedChapters.append(chapter)
+      previousStart = chapter.start
+    }
+
+    guard !normalizedChapters.isEmpty else { return nil }
+
+    var result: [ChapterMetadata] = []
+    for (index, chapter) in normalizedChapters.enumerated() {
+      let nextStart = index < normalizedChapters.count - 1 ? normalizedChapters[index + 1].start : duration
+      let chapterDuration = nextStart - chapter.start
+      guard chapterDuration > 0 else { continue }
+
+      let trimmedTitle = chapter.title?.trimmingCharacters(in: .whitespacesAndNewlines)
+      let finalTitle = (trimmedTitle?.isEmpty == false) ? trimmedTitle! : "Chapter \(index + 1)"
+
+      result.append(
+        ChapterMetadata(
+          title: finalTitle,
+          start: chapter.start,
+          duration: chapterDuration,
+          index: index + 1
+        )
+      )
+    }
+
+    return result.isEmpty ? nil : result
+  }
+
+  static func parseChapterFrame(from rawFrameData: Data) -> ParsedChapter? {
+    let payload = stripCHAPFrameHeaderIfNeeded(from: rawFrameData)
+
+    guard let elementIdEnd = payload.firstIndex(of: 0) else { return nil }
+    let minimumLengthAfterElementId = 16
+    guard payload.count >= elementIdEnd + 1 + minimumLengthAfterElementId else { return nil }
+
+    let startOffset = elementIdEnd + 1
+    let startMilliseconds = UInt32(bigEndianData: payload.subdata(in: startOffset..<(startOffset + 4)))
+    let startSeconds = TimeInterval(startMilliseconds) / 1000
+
+    let subFramesOffset = startOffset + minimumLengthAfterElementId
+    let title = payload.count > subFramesOffset
+      ? parseChapterTitle(from: payload.subdata(in: subFramesOffset..<payload.count))
+      : nil
+
+    return ParsedChapter(start: startSeconds, title: title)
+  }
+
+  private static func stripCHAPFrameHeaderIfNeeded(from data: Data) -> Data {
+    guard data.count > 10 else { return data }
+
+    let frameIdentifier = String(data: data.subdata(in: 0..<4), encoding: .ascii)
+    guard frameIdentifier == "CHAP" else { return data }
+
+    let sizeBytes = data.subdata(in: 4..<8)
+    let standardSize = Int(UInt32(bigEndianData: sizeBytes))
+    let syncSafeSize = Int(UInt32(syncSafeData: sizeBytes))
+
+    if standardSize > 0, 10 + standardSize <= data.count {
+      return data.subdata(in: 10..<(10 + standardSize))
+    }
+
+    if syncSafeSize > 0, 10 + syncSafeSize <= data.count {
+      return data.subdata(in: 10..<(10 + syncSafeSize))
+    }
+
+    return data.subdata(in: 10..<data.count)
+  }
+
+  private static func extractCHAPFrames(fromID3TagData tagData: Data, majorVersion: Int, flags: UInt8) -> [Data]? {
+    var framesOffset = 0
+
+    // ID3 extended header
+    if (flags & 0x40) != 0 {
+      guard tagData.count >= 4 else { return nil }
+      let extHeaderSize: Int
+      if majorVersion == 4 {
+        extHeaderSize = Int(UInt32(syncSafeData: tagData.subdata(in: 0..<4)))
+      } else {
+        extHeaderSize = Int(UInt32(bigEndianData: tagData.subdata(in: 0..<4)))
+      }
+      guard extHeaderSize > 0, extHeaderSize <= tagData.count else { return nil }
+      framesOffset = extHeaderSize
+    }
+
+    var chapterFrames: [Data] = []
+    var offset = framesOffset
+
+    while offset + 10 <= tagData.count {
+      let frameHeader = tagData.subdata(in: offset..<(offset + 10))
+      let frameIdData = frameHeader.subdata(in: 0..<4)
+
+      if frameIdData.allSatisfy({ $0 == 0 }) {
+        break
+      }
+
+      guard let frameId = String(data: frameIdData, encoding: .ascii),
+            frameId.allSatisfy({ $0.isASCII && !$0.isWhitespace }) else {
+        break
+      }
+
+      let sizeBytes = frameHeader.subdata(in: 4..<8)
+      let standardSize = Int(UInt32(bigEndianData: sizeBytes))
+      let syncSafeSize = Int(UInt32(syncSafeData: sizeBytes))
+      let frameSize: Int
+      if majorVersion == 4 {
+        frameSize = syncSafeSize
+      } else {
+        frameSize = standardSize
+      }
+
+      guard frameSize > 0 else { break }
+      let nextOffset = offset + 10 + frameSize
+      guard nextOffset <= tagData.count else { break }
+
+      if frameId == "CHAP" {
+        chapterFrames.append(tagData.subdata(in: offset..<nextOffset))
+      }
+
+      offset = nextOffset
+    }
+
+    return chapterFrames.isEmpty ? nil : chapterFrames
+  }
+
+  private static func parseChapterTitle(from subFramesData: Data) -> String? {
+    var offset = 0
+
+    while offset + 10 <= subFramesData.count {
+      let frameIdData = subFramesData.subdata(in: offset..<(offset + 4))
+      guard let frameId = String(data: frameIdData, encoding: .ascii),
+            frameId.allSatisfy({ $0.isASCII && !$0.isWhitespace }) else {
+        break
+      }
+
+      let frameSizeData = subFramesData.subdata(in: (offset + 4)..<(offset + 8))
+      let standardSize = Int(UInt32(bigEndianData: frameSizeData))
+      let syncSafeSize = Int(UInt32(syncSafeData: frameSizeData))
+
+      let frameSize: Int
+      if standardSize > 0, offset + 10 + standardSize <= subFramesData.count {
+        frameSize = standardSize
+      } else if syncSafeSize > 0, offset + 10 + syncSafeSize <= subFramesData.count {
+        frameSize = syncSafeSize
+      } else {
+        break
+      }
+
+      let payloadStart = offset + 10
+      let payloadEnd = payloadStart + frameSize
+      let payload = subFramesData.subdata(in: payloadStart..<payloadEnd)
+
+      if frameId == "TIT2" || frameId == "TIT3",
+         let title = decodeTextFramePayload(payload),
+         !title.isEmpty {
+        return title
+      }
+
+      offset = payloadEnd
+    }
+
+    return nil
+  }
+
+  private static func decodeTextFramePayload(_ payload: Data) -> String? {
+    guard !payload.isEmpty else { return nil }
+
+    let encodingByte = payload[payload.startIndex]
+    let textData = payload.dropFirst()
+
+    let decodedText: String?
+    switch encodingByte {
+    case 0:
+      decodedText = String(data: Data(textData), encoding: .isoLatin1)
+    case 1:
+      decodedText = String(data: Data(textData), encoding: .utf16)
+    case 2:
+      decodedText = String(data: Data(textData), encoding: .utf16BigEndian)
+    case 3:
+      decodedText = String(data: Data(textData), encoding: .utf8)
+    default:
+      decodedText = String(data: Data(textData), encoding: .utf8)
+    }
+
+    return decodedText?
+      .replacingOccurrences(of: "\u{0000}", with: "")
+      .trimmingCharacters(in: .whitespacesAndNewlines)
+  }
+}
+
+private extension UInt32 {
+  init(bigEndianData data: Data) {
+    precondition(data.count == 4)
+    self = data.reduce(UInt32(0)) { partialResult, byte in
+      (partialResult << 8) | UInt32(byte)
+    }
+  }
+
+  init(syncSafeData data: Data) {
+    precondition(data.count == 4)
+    self = data.reduce(UInt32(0)) { partialResult, byte in
+      (partialResult << 7) | UInt32(byte & 0x7F)
+    }
   }
 }

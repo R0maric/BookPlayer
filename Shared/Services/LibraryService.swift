@@ -151,7 +151,7 @@ public protocol LibraryServiceProtocol: AnyObject {
 
 // swiftlint:disable force_cast
 @Observable
-public final class LibraryService: LibraryServiceProtocol, @unchecked Sendable {
+public final class LibraryService: LibraryServiceProtocol, BPLogger, @unchecked Sendable {
   var dataManager: DataManager!
   var audioMetadataService: AudioMetadataServiceProtocol!
 
@@ -768,6 +768,17 @@ extension LibraryService {
       chapter.index = Int16(chapterMeta.index)
       book.addToChapters(chapter)
     }
+  }
+
+  private func replaceChapters(_ chapters: [ChapterMetadata], for book: Book, context: NSManagedObjectContext) {
+    if let existingChapters = book.chapters?.array as? [Chapter] {
+      for existingChapter in existingChapters {
+        context.delete(existingChapter)
+      }
+      book.chapters = nil
+    }
+
+    storeChapters(chapters, for: book, context: context)
   }
 
   /// Overload for backwards compatibility when we need to query by relativePath
@@ -1500,6 +1511,116 @@ extension LibraryService {
 
 // MARK: - Metadata update
 extension LibraryService {
+  private struct ChapterLoadDecision {
+    let shouldExtractMetadata: Bool
+    let shouldAttemptLegacyRepair: Bool
+    let isMP3: Bool
+  }
+
+  private func chapterLoadDecision(for book: Book) -> ChapterLoadDecision {
+    let existingChapters = (book.chapters?.array as? [Chapter]) ?? []
+    let hasNoChapters = existingChapters.isEmpty
+    let isMP3 = (book.relativePath as NSString).pathExtension.lowercased() == "mp3"
+
+    guard isMP3 else {
+      return ChapterLoadDecision(
+        shouldExtractMetadata: hasNoChapters,
+        shouldAttemptLegacyRepair: false,
+        isMP3: false
+      )
+    }
+
+    // For MP3 books, attempt a single legacy repair pass unless already marked as migrated.
+    // This avoids missing books that still have one "valid-looking" but legacy chapter.
+    let shouldAttemptLegacyRepair = !isMP3ChapterRepairDone(for: book.relativePath)
+
+    return ChapterLoadDecision(
+      shouldExtractMetadata: hasNoChapters || shouldAttemptLegacyRepair,
+      shouldAttemptLegacyRepair: shouldAttemptLegacyRepair,
+      isMP3: true
+    )
+  }
+
+  private func isMP3ChapterRepairDone(for relativePath: String) -> Bool {
+    UserDefaults.standard.bool(forKey: mp3ChapterRepairMigrationKey(for: relativePath))
+  }
+
+  private func setMP3ChapterRepairDone(for relativePath: String) {
+    UserDefaults.standard.set(true, forKey: mp3ChapterRepairMigrationKey(for: relativePath))
+  }
+
+  private func mp3ChapterRepairMigrationKey(for relativePath: String) -> String {
+    "\(Constants.UserDefaults.mp3ChapterRepairMigrationPrefix)_v\(Constants.UserDefaults.mp3ChapterRepairMigrationVersion)_\(relativePath)"
+  }
+
+  private func hasInvalidStoredChapters(_ chapters: [Chapter], duration: TimeInterval) -> Bool {
+    guard !chapters.isEmpty else { return true }
+
+    var previousStart: TimeInterval = -1
+
+    for chapter in chapters {
+      let start = chapter.start
+      let chapterDuration = chapter.duration
+
+      guard start >= 0,
+            chapterDuration > 0,
+            start > previousStart
+      else {
+        return true
+      }
+
+      if duration > 0, start >= duration {
+        return true
+      }
+
+      previousStart = start
+    }
+
+    return false
+  }
+
+  private func hasValidExtractedChapters(_ chapters: [ChapterMetadata], duration: TimeInterval) -> Bool {
+    guard !chapters.isEmpty else { return false }
+
+    var previousStart: TimeInterval = -1
+    for chapter in chapters {
+      guard chapter.start >= 0,
+            chapter.duration > 0,
+            chapter.start > previousStart
+      else {
+        return false
+      }
+
+      if duration > 0, chapter.start >= duration {
+        return false
+      }
+
+      previousStart = chapter.start
+    }
+
+    return true
+  }
+
+  private func shouldReplaceStoredChapters(
+    _ existingChapters: [Chapter],
+    with extractedChapters: [ChapterMetadata],
+    duration: TimeInterval
+  ) -> Bool {
+    guard !existingChapters.isEmpty else { return true }
+    guard !hasInvalidStoredChapters(existingChapters, duration: duration) else { return true }
+    guard extractedChapters.count >= existingChapters.count else { return false }
+
+    if extractedChapters.count > existingChapters.count {
+      return true
+    }
+
+    return zip(existingChapters, extractedChapters).contains { existingChapter, extractedChapter in
+      abs(existingChapter.start - extractedChapter.start) > 0.05
+        || abs(existingChapter.duration - extractedChapter.duration) > 0.05
+        || (existingChapter.title ?? "") != extractedChapter.title
+    }
+  }
+
   public func createBook(from url: URL) async -> Book {
     let context = dataManager.getContext()
     
@@ -1521,29 +1642,63 @@ extension LibraryService {
   public func loadChaptersIfNeeded(relativePath: String, asset: AVAsset) async {
     let context = dataManager.getBackgroundContext()
 
-    // First, check if we need to load chapters
-    let needsChapters = await context.perform { [unowned self] in
+    let loadDecision = await context.perform { [unowned self] in
       guard let book = self.getItem(with: relativePath, context: context) as? Book else {
-        return false
+        return ChapterLoadDecision(
+          shouldExtractMetadata: false,
+          shouldAttemptLegacyRepair: false,
+          isMP3: false
+        )
       }
-      return book.chapters?.count == 0
+      return self.chapterLoadDecision(for: book)
     }
 
-    guard needsChapters else { return }
-
-    // Extract metadata outside of context.perform
-    guard let metadata = await audioMetadataService.extractMetadata(from: asset),
-          let chapters = metadata.chapters else {
+    guard loadDecision.shouldExtractMetadata else {
+      if loadDecision.isMP3 {
+        Self.logger.debug("MP3 chapter repair skipped: already migrated and chapters already present")
+      }
       return
     }
 
-    // Store chapters in the context, re-checking if still needed to avoid race conditions
+    if loadDecision.shouldAttemptLegacyRepair {
+      Self.logger.info("MP3 chapter repair attempt started")
+    }
+
+    guard let metadata = await audioMetadataService.extractMetadata(from: asset),
+          let chapters = metadata.chapters else {
+      if loadDecision.shouldAttemptLegacyRepair {
+        Self.logger.info("MP3 chapter repair skipped: no metadata chapters available")
+      }
+      return
+    }
+
     await context.perform { [unowned self] in
-      guard let book = self.getItem(with: relativePath, context: context) as? Book,
-            book.chapters?.count == 0 else {
+      guard let book = self.getItem(with: relativePath, context: context) as? Book else {
         return
       }
-      self.storeChapters(chapters, for: book, context: context)
+
+      let currentChapters = (book.chapters?.array as? [Chapter]) ?? []
+
+      if loadDecision.shouldAttemptLegacyRepair {
+        guard self.hasValidExtractedChapters(chapters, duration: book.duration) else {
+          Self.logger.info("MP3 chapter repair skipped: extracted chapters are invalid")
+          return
+        }
+
+        if self.shouldReplaceStoredChapters(currentChapters, with: chapters, duration: book.duration) {
+          self.replaceChapters(chapters, for: book, context: context)
+          Self.logger.info("MP3 chapter repair applied")
+        } else {
+          Self.logger.debug("MP3 chapter repair skipped: stored chapters are already up to date")
+        }
+
+        // Mark repair done after a successful extraction attempt, even if replacement wasn't needed.
+        self.setMP3ChapterRepairDone(for: relativePath)
+      } else {
+        guard currentChapters.isEmpty else { return }
+        self.storeChapters(chapters, for: book, context: context)
+      }
+
       self.dataManager.saveSyncContext(context)
     }
   }
