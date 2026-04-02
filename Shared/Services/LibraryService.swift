@@ -1530,12 +1530,9 @@ extension LibraryService {
       )
     }
 
+    // For MP3 books, attempt a single legacy repair pass unless already marked as migrated.
+    // This avoids missing books that still have one "valid-looking" but legacy chapter.
     let shouldAttemptLegacyRepair = !isMP3ChapterRepairDone(for: book.relativePath)
-      && (
-        hasNoChapters
-          || hasInvalidStoredChapters(existingChapters, duration: book.duration)
-          || looksLikeLegacySingleChapter(existingChapters, duration: book.duration)
-      )
 
     return ChapterLoadDecision(
       shouldExtractMetadata: hasNoChapters || shouldAttemptLegacyRepair,
@@ -1578,21 +1575,6 @@ extension LibraryService {
     }
 
     return false
-  }
-
-  private func looksLikeLegacySingleChapter(_ chapters: [Chapter], duration: TimeInterval) -> Bool {
-    guard chapters.count == 1,
-          duration > 0
-    else {
-      return false
-    }
-
-    let onlyChapter = chapters[0]
-    let isStartAtZero = abs(onlyChapter.start) < 0.05
-    let isWholeBookDuration = abs(onlyChapter.duration - duration) < 0.5
-    let looksLikeFallbackTitle = onlyChapter.title?.hasPrefix("Chapter") ?? false
-
-    return isStartAtZero && isWholeBookDuration && looksLikeFallbackTitle
   }
 
   private func hasValidExtractedChapters(_ chapters: [ChapterMetadata], duration: TimeInterval) -> Bool {
@@ -1692,13 +1674,13 @@ extension LibraryService {
           return
         }
 
-        guard self.shouldReplaceStoredChapters(currentChapters, with: chapters, duration: book.duration) else {
-          return
+        if self.shouldReplaceStoredChapters(currentChapters, with: chapters, duration: book.duration) {
+          self.replaceChapters(chapters, for: book, context: context)
+          Self.logger.info("MP3 legacy chapter repair applied for \(relativePath)")
         }
 
-        self.replaceChapters(chapters, for: book, context: context)
+        // Mark repair done after a successful extraction attempt, even if replacement wasn't needed.
         self.setMP3ChapterRepairDone(for: relativePath)
-        Self.logger.info("MP3 legacy chapter repair applied for \(relativePath)")
       } else {
         guard currentChapters.isEmpty else { return }
         self.storeChapters(chapters, for: book, context: context)
@@ -1707,18 +1689,7 @@ extension LibraryService {
       self.dataManager.saveSyncContext(context)
     }
 
-    if loadDecision.shouldAttemptLegacyRepair {
-      let verificationDecision = await context.perform { [unowned self] in
-        guard let book = self.getItem(with: relativePath, context: context) as? Book else {
-          return false
-        }
-        return !self.chapterLoadDecision(for: book).shouldAttemptLegacyRepair
-      }
-
-      if verificationDecision {
-        setMP3ChapterRepairDone(for: relativePath)
-      }
-    } else if loadDecision.isMP3 {
+    if !loadDecision.shouldAttemptLegacyRepair, loadDecision.isMP3 {
       let hasStoredChapters = await context.perform { [unowned self] in
         guard let book = self.getItem(with: relativePath, context: context) as? Book else {
           return false

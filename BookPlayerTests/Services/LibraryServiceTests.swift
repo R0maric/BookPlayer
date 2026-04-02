@@ -1998,8 +1998,9 @@ class LegacyMP3ChapterRepairTests: LibraryServiceTests {
     )
 
     await sut.loadChaptersIfNeeded(relativePath: book.relativePath, asset: AVAsset(url: URL(fileURLWithPath: "/dev/null")))
+    await sut.loadChaptersIfNeeded(relativePath: book.relativePath, asset: AVAsset(url: URL(fileURLWithPath: "/dev/null")))
 
-    XCTAssertEqual(mockAudioMetadataService.extractMetadataFromAssetCallCount, 0)
+    XCTAssertEqual(mockAudioMetadataService.extractMetadataFromAssetCallCount, 1)
   }
 
   func testLoadChaptersIfNeededKeepsExistingChaptersWhenRepairMetadataIsInvalid() async {
