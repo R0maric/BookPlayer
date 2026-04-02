@@ -225,6 +225,12 @@ final class PlayerManager: NSObject, PlayerManagerProtocol, ObservableObject {
       await ArtworkService.storeInCache(data, for: chapter.relativePath)
     }
 
+    try await refreshChaptersIfNeeded(for: chapter, asset: asset)
+
+    return asset
+  }
+
+  private func refreshChaptersIfNeeded(for chapter: PlayableChapter, asset: AVURLAsset) async throws {
     if currentItem?.isBoundBook == false {
       await libraryService.loadChaptersIfNeeded(relativePath: chapter.relativePath, asset: asset)
 
@@ -235,8 +241,6 @@ final class PlayerManager: NSObject, PlayerManagerProtocol, ObservableObject {
       /// recently synced m4b files do not have their chapters loaded outright
       await libraryService.loadChaptersIfNeeded(relativePath: chapter.relativePath, asset: asset)
     }
-
-    return asset
   }
 
   func loadPlayerItem(for chapter: PlayableChapter, forceRefreshURL: Bool) async throws {
@@ -250,17 +254,7 @@ final class PlayerManager: NSObject, PlayerManagerProtocol, ObservableObject {
       asset = try await loadRemoteURLAsset(for: chapter, forceRefresh: forceRefreshURL)
     } else {
       asset = AVURLAsset(url: fileURL, options: [AVURLAssetPreferPreciseDurationAndTimingKey: true])
-
-      if currentItem?.isBoundBook == false {
-        await libraryService.loadChaptersIfNeeded(relativePath: chapter.relativePath, asset: asset)
-
-        if let libraryItem = libraryService.getSimpleItem(with: chapter.relativePath) {
-          currentItem = try playbackService.getPlayableItem(from: libraryItem)
-        }
-      } else if currentItem?.isBoundBook == true, chapter.relativePath.hasSuffix(".m4b") {
-        /// recently synced m4b files do not have their chapters loaded outright
-        await libraryService.loadChaptersIfNeeded(relativePath: chapter.relativePath, asset: asset)
-      }
+      try await refreshChaptersIfNeeded(for: chapter, asset: asset)
     }
 
     // Clean just in case

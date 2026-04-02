@@ -55,7 +55,8 @@ public enum Constants {
 
     // One-time migrations
     public static let fileProtectionMigration = "userFileProtectionMigration"
-    public static let mp3ChapterRepairMigrationPrefix = "userMP3ChapterRepairMigrationV2"
+    public static let mp3ChapterRepairMigrationPrefix = "userMP3ChapterRepairMigration"
+    public static let mp3ChapterRepairMigrationVersion = 2
 
     /// Shared widget currently playing relative path
     public static let sharedWidgetNowPlayingPath = "sharedWidgetNowPlayingPath"

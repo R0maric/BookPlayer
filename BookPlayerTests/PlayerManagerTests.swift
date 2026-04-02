@@ -16,6 +16,8 @@ import XCTest
 
 class PlayerManagerTests: XCTestCase {
   var playbackServiceMock: PlaybackServiceProtocolMock!
+  var libraryServiceMock: LibraryServiceProtocolMock!
+  var syncServiceMock: SyncServiceProtocolMock!
   var sut: PlayerManager!
 
   override func setUp() {
@@ -24,10 +26,13 @@ class PlayerManagerTests: XCTestCase {
     UserDefaults.sharedDefaults.removeObject(forKey: Constants.UserDefaults.remainingTimeEnabled)
 
     self.playbackServiceMock = PlaybackServiceProtocolMock()
+    self.libraryServiceMock = LibraryServiceProtocolMock()
+    self.syncServiceMock = SyncServiceProtocolMock()
+    self.syncServiceMock.isActive = false
     self.sut = PlayerManager(
-      libraryService: LibraryServiceProtocolMock(),
+      libraryService: libraryServiceMock,
       playbackService: playbackServiceMock,
-      syncService: SyncServiceProtocolMock(),
+      syncService: syncServiceMock,
       speedService: SpeedServiceProtocolMock(),
       shakeMotionService: ShakeMotionServiceProtocolMock(),
       widgetReloadService: WidgetReloadService()
@@ -196,5 +201,76 @@ class PlayerManagerTests: XCTestCase {
 
     XCTAssertNil(nextItem)
     XCTAssertTrue(playbackServiceMock.getPlayableItemAfterParentFolderAutoplayedRestartFinishedCallsCount == 2)
+  }
+
+  func testLoadPlayerItemLocalTriggersChapterRefresh() async throws {
+    let relativePath = "local-\(UUID().uuidString).mp3"
+    try createPlayableFile(relativePath: relativePath)
+
+    let chapter = makeChapter(relativePath: relativePath, remoteURL: nil)
+    sut.currentItem = makePlayableItem(for: chapter)
+
+    try await sut.loadPlayerItem(for: chapter, forceRefreshURL: false)
+
+    XCTAssertEqual(libraryServiceMock.loadChaptersIfNeededRelativePathAssetCallsCount, 1)
+    XCTAssertEqual(libraryServiceMock.loadChaptersIfNeededRelativePathAssetReceivedArguments?.relativePath, relativePath)
+  }
+
+  func testLoadRemoteURLAssetTriggersChapterRefresh() async throws {
+    let relativePath = "remote-\(UUID().uuidString).mp3"
+    let remoteURL = try createPlayableFile(relativePath: relativePath)
+
+    let chapter = makeChapter(relativePath: relativePath, remoteURL: remoteURL)
+    sut.currentItem = makePlayableItem(for: chapter)
+
+    _ = try await sut.loadRemoteURLAsset(for: chapter, forceRefresh: false)
+
+    XCTAssertEqual(libraryServiceMock.loadChaptersIfNeededRelativePathAssetCallsCount, 1)
+    XCTAssertEqual(libraryServiceMock.loadChaptersIfNeededRelativePathAssetReceivedArguments?.relativePath, relativePath)
+  }
+
+  private func makeChapter(relativePath: String, remoteURL: URL?) -> PlayableChapter {
+    PlayableChapter(
+      title: "chapter",
+      author: "author",
+      start: 0,
+      duration: 10,
+      relativePath: relativePath,
+      remoteURL: remoteURL,
+      index: 0
+    )
+  }
+
+  private func makePlayableItem(for chapter: PlayableChapter) -> PlayableItem {
+    PlayableItem(
+      title: "book",
+      author: "author",
+      chapters: [chapter],
+      currentTime: 0,
+      duration: chapter.duration,
+      relativePath: chapter.relativePath,
+      parentFolder: nil,
+      percentCompleted: 0,
+      lastPlayDate: nil,
+      isFinished: false,
+      isBoundBook: false
+    )
+  }
+
+  @discardableResult
+  private func createPlayableFile(relativePath: String) throws -> URL {
+    let fileURL = DataManager.getProcessedFolderURL().appendingPathComponent(relativePath)
+    let folderURL = fileURL.deletingLastPathComponent()
+
+    try FileManager.default.createDirectory(
+      at: folderURL,
+      withIntermediateDirectories: true,
+      attributes: nil
+    )
+    if !FileManager.default.fileExists(atPath: fileURL.path) {
+      FileManager.default.createFile(atPath: fileURL.path, contents: Data("test".utf8))
+    }
+
+    return fileURL
   }
 }

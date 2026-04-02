@@ -2024,10 +2024,12 @@ class LegacyMP3ChapterRepairTests: LibraryServiceTests {
     )
 
     await sut.loadChaptersIfNeeded(relativePath: book.relativePath, asset: AVAsset(url: URL(fileURLWithPath: "/dev/null")))
+    await sut.loadChaptersIfNeeded(relativePath: book.relativePath, asset: AVAsset(url: URL(fileURLWithPath: "/dev/null")))
 
     let chapters = sut.getChapters(from: book.relativePath)
     XCTAssertEqual(chapters?.count, 1)
     XCTAssertEqual(chapters?.first?.title, "Legacy Chapter")
     XCTAssertEqual(chapters?.first?.duration ?? -1, 100, accuracy: 0.000_1)
+    XCTAssertEqual(mockAudioMetadataService.extractMetadataFromAssetCallCount, 2)
   }
 }

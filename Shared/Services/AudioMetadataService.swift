@@ -81,21 +81,11 @@ public class AudioMetadataService: BPLogger, AudioMetadataServiceProtocol {
       let artist = await extractArtist(from: metadata)
       let artwork = await extractArtwork(from: metadata)
       var chapters = await extractChapters(from: asset, metadata: metadata, duration: durationSeconds)
-
-      if chapters == nil,
-         let urlAsset = asset as? AVURLAsset,
-         urlAsset.url.pathExtension.lowercased() == "mp3",
-         let id3Chapters = ID3ChapterParser.parseChapters(
-           fromMP3File: urlAsset.url,
-           duration: durationSeconds
-         ),
-         !id3Chapters.isEmpty {
-        chapters = id3Chapters
-      } else if chapters == nil,
-                let urlAsset = asset as? AVURLAsset,
-                urlAsset.url.pathExtension.lowercased() == "mp3" {
-        Self.logger.info("No usable ID3 CHAP chapters found in MP3 file fallback parser")
-      }
+      chapters = resolveMP3FallbackChaptersIfNeeded(
+        from: asset,
+        duration: durationSeconds,
+        existingChapters: chapters
+      )
 
       return AudioMetadata(
         title: title,
@@ -109,6 +99,29 @@ public class AudioMetadataService: BPLogger, AudioMetadataServiceProtocol {
       Self.logger.error("Failed to extract metadata from audio asset: \(error)")
       return nil
     }
+  }
+
+  private func resolveMP3FallbackChaptersIfNeeded(
+    from asset: AVAsset,
+    duration: TimeInterval,
+    existingChapters: [ChapterMetadata]?
+  ) -> [ChapterMetadata]? {
+    guard existingChapters == nil else { return existingChapters }
+    guard let urlAsset = asset as? AVURLAsset else { return nil }
+    guard urlAsset.url.pathExtension.lowercased() == "mp3" else { return nil }
+
+    guard let chapters = ID3ChapterParser.parseChapters(
+      fromMP3File: urlAsset.url,
+      duration: duration
+    ),
+    !chapters.isEmpty
+    else {
+      Self.logger.info("MP3 CHAP fallback skipped: no usable ID3 chapter data")
+      return nil
+    }
+
+    Self.logger.info("MP3 CHAP fallback applied from ID3 tag data")
+    return chapters
   }
   
   private func extractTitle(from metadata: [AVMetadataItem]) async -> String {
