@@ -68,27 +68,7 @@ public class AudioMetadataService: BPLogger, AudioMetadataServiceProtocol {
   
   public func extractMetadata(from fileURL: URL) async -> AudioMetadata? {
     let asset = AVURLAsset(url: fileURL)
-    guard let metadata = await extractMetadata(from: asset) else { return nil }
-
-    guard metadata.chapters == nil,
-          fileURL.pathExtension.lowercased() == "mp3"
-    else {
-      return metadata
-    }
-
-    if let chapters = ID3ChapterParser.parseChapters(fromMP3File: fileURL, duration: metadata.duration),
-       !chapters.isEmpty {
-      return AudioMetadata(
-        title: metadata.title,
-        artist: metadata.artist,
-        duration: metadata.duration,
-        artwork: metadata.artwork,
-        chapters: chapters
-      )
-    }
-
-    Self.logger.info("No usable ID3 CHAP chapters found in MP3 file fallback parser")
-    return metadata
+    return await extractMetadata(from: asset)
   }
   
   public func extractMetadata(from asset: AVAsset) async -> AudioMetadata? {
@@ -100,7 +80,22 @@ public class AudioMetadataService: BPLogger, AudioMetadataServiceProtocol {
       let title = await extractTitle(from: metadata)
       let artist = await extractArtist(from: metadata)
       let artwork = await extractArtwork(from: metadata)
-      let chapters = await extractChapters(from: asset, metadata: metadata, duration: durationSeconds)
+      var chapters = await extractChapters(from: asset, metadata: metadata, duration: durationSeconds)
+
+      if chapters == nil,
+         let urlAsset = asset as? AVURLAsset,
+         urlAsset.url.pathExtension.lowercased() == "mp3",
+         let id3Chapters = ID3ChapterParser.parseChapters(
+           fromMP3File: urlAsset.url,
+           duration: durationSeconds
+         ),
+         !id3Chapters.isEmpty {
+        chapters = id3Chapters
+      } else if chapters == nil,
+                let urlAsset = asset as? AVURLAsset,
+                urlAsset.url.pathExtension.lowercased() == "mp3" {
+        Self.logger.info("No usable ID3 CHAP chapters found in MP3 file fallback parser")
+      }
 
       return AudioMetadata(
         title: title,
